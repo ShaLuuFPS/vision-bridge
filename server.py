@@ -6,11 +6,13 @@ Sends images through Moonshot's Anthropic Messages API, returns text.
 不支持 GPT-4o / Gemini / Claude Vision 等其他模型。
 """
 import base64
+import io
 import os
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from anthropic import AsyncAnthropic
+from PIL import Image
 
 mcp = FastMCP("vision-bridge")
 
@@ -18,11 +20,28 @@ API_KEY = os.environ.get("MOONSHOT_API_KEY", "")
 BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.moonshot.cn/anthropic")
 MODEL = os.environ.get("VISION_MODEL", "kimi-k2.6")
 
+# 图片最大边长（缩图后发送，减少传输+推理时间）
+MAX_DIM = 768
+
 
 def _client():
     if not API_KEY:
         return None
-    return AsyncAnthropic(api_key=API_KEY, base_url=BASE_URL)
+    # 显式超时：120s（Kimi 视觉模型有时较慢，默认太短会 -32001）
+    return AsyncAnthropic(api_key=API_KEY, base_url=BASE_URL, timeout=120.0)
+
+
+def _encode_image(path: Path) -> tuple[str, str]:
+    """读图 → 缩放到 MAX_DIM → JPEG 压缩 → base64。返回 (data, media_type)。"""
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    scale = MAX_DIM / max(w, h)
+    if scale < 1:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return data, "image/jpeg"
 
 
 @mcp.tool()
@@ -48,20 +67,10 @@ async def describe_image(image_path: str, question: str = "") -> str:
     if not path.exists():
         return f"❌ File not found: {image_path}"
 
-    suffix = path.suffix.lower()
-    media_types = {
-        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-    }
-    media_type = media_types.get(suffix)
-    if media_type is None:
-        return f"❌ Unsupported format: {suffix} (ok: {', '.join(media_types)})"
-
     try:
-        with open(path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode("utf-8")
+        image_data, media_type = _encode_image(path)
     except Exception as e:
-        return f"❌ Failed to read image: {e}"
+        return f"❌ Failed to read/encode image: {e}"
 
     prompt = question.strip() or (
         "请详细描述这张图片的内容。包括："
